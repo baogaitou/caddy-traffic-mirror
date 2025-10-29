@@ -1,0 +1,47 @@
+{
+    debug
+    admin off
+
+    log mirror_log {
+        output file ./mirror.log
+        format console
+    }
+}
+
+# Origin
+:8090 {
+    log {
+        output file ./access.log
+        format console
+    }
+
+    route {
+        handle /demo {
+            respond "Demo" 200
+        }
+
+        route /api/* {
+            traffic_mirror {
+                target_url http://localhost:9090
+                methods GET POST
+                # disable_log
+                # log_level INFO
+                add_mirror_headers true
+                timeout 3
+            }
+
+            respond "API from Origin" 200
+        }
+
+        handle  {
+            respond /* "Other path from Origin" 200
+        }
+    }
+}
+
+# Mirror - 9090
+:9090 {
+    log mirror_log
+
+    respond "Received by Mirror Server (9090): {http.request.uri}" 200
+}
