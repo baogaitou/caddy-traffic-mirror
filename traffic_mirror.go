@@ -5,8 +5,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -44,8 +46,11 @@ type TrafficMirror struct {
 	// 是否禁用镜像请求日志
 	DisableLog bool `json:"disable_log,omitempty"`
 
-	logger *zap.Logger
-	client *http.Client
+	logger     *zap.Logger
+	client     *http.Client
+	bufferPool *sync.Pool
+	routeSet   map[string]struct{}
+	methodSet  map[string]struct{}
 }
 
 // CaddyModule 返回模块信息
@@ -68,9 +73,46 @@ func (m *TrafficMirror) Provision(ctx caddy.Context) error {
 		m.LogLevel = "debug"
 	}
 
+	// 初始化用于复用请求体缓冲区的池
+	m.bufferPool = &sync.Pool{
+		New: func() interface{} {
+			return new(bytes.Buffer)
+		},
+	}
+
+	// 将路由和方法切片转换为 map 以提高查找效率
+	if len(m.Routes) > 0 {
+		m.routeSet = make(map[string]struct{}, len(m.Routes))
+		for _, route := range m.Routes {
+			m.routeSet[route] = struct{}{}
+		}
+	}
+	if len(m.Methods) > 0 {
+		m.methodSet = make(map[string]struct{}, len(m.Methods))
+		for _, method := range m.Methods {
+			m.methodSet[strings.ToUpper(method)] = struct{}{}
+		}
+	}
+
+	// 创建自定义 transport 以优化连接池
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          200, // 增加最大空闲连接数
+		MaxIdleConnsPerHost:   100, // 增加每个主机的最大空闲连接数
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	// 创建HTTP客户端
 	m.client = &http.Client{
-		Timeout: time.Duration(m.Timeout) * time.Second,
+		Transport: transport,
+		Timeout:   time.Duration(m.Timeout) * time.Second,
 		// 不跟随重定向
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -113,30 +155,40 @@ func (m *TrafficMirror) Validate() error {
 	return nil
 }
 
-// copyRequestBody 安全地复制请求体
-func (m *TrafficMirror) copyRequestBody(r *http.Request) ([]byte, error) {
+// copyRequestBody 安全地复制请求体，并使用 sync.Pool 优化内存分配
+func (m *TrafficMirror) copyRequestBody(r *http.Request) (*bytes.Buffer, error) {
 	if r.Body == nil || r.Body == http.NoBody {
 		return nil, nil
 	}
 
-	// 读取原始请求体
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read request body: %w", err)
+	// 从池中获取一个缓冲区
+	buf := m.bufferPool.Get().(*bytes.Buffer)
+	buf.Reset() // 确保缓冲区是空的
+
+	// 将请求体同时写入缓冲区和丢弃目标，以恢复原始请求体
+	// 这样后续的处理程序仍然可以读取它
+	r.Body = io.NopCloser(io.TeeReader(r.Body, buf))
+
+	// 必须读取整个请求体，以确保缓冲区被完全填充
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		m.bufferPool.Put(buf) // 出错时将缓冲区放回池中
+		return nil, fmt.Errorf("failed to copy request body: %w", err)
 	}
 
-	// 恢复原始请求体，以便后续处理
-	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	// 再次恢复请求体，因为上面的 io.Copy 消耗了它
+	r.Body = io.NopCloser(bytes.NewReader(buf.Bytes()))
 
-	return bodyBytes, nil
+	return buf, nil
 }
 
 // shouldMirror 检查是否应该复制这个请求
 func (m *TrafficMirror) shouldMirror(r *http.Request) bool {
-	// 检查路由匹配
-	if len(m.Routes) > 0 {
+	// 使用 map 检查路由匹配，提高效率
+	if len(m.routeSet) > 0 {
 		pathMatched := false
-		for _, route := range m.Routes {
+		// 虽然这里仍然是循环，但它避免了对原始切片的迭代
+		// 对于大量前缀，更高级的结构（如Trie）会更快
+		for route := range m.routeSet {
 			if strings.HasPrefix(r.URL.Path, route) {
 				pathMatched = true
 				break
@@ -147,16 +199,9 @@ func (m *TrafficMirror) shouldMirror(r *http.Request) bool {
 		}
 	}
 
-	// 检查方法匹配
-	if len(m.Methods) > 0 {
-		methodMatched := false
-		for _, method := range m.Methods {
-			if r.Method == method {
-				methodMatched = true
-				break
-			}
-		}
-		if !methodMatched {
+	// 使用 map 检查方法匹配，实现 O(1) 查找
+	if len(m.methodSet) > 0 {
+		if _, ok := m.methodSet[r.Method]; !ok {
 			return false
 		}
 	}
@@ -165,7 +210,7 @@ func (m *TrafficMirror) shouldMirror(r *http.Request) bool {
 }
 
 // createMirrorRequest 创建复制请求
-func (m *TrafficMirror) createMirrorRequest(originalReq *http.Request, body []byte) (*http.Request, error) {
+func (m *TrafficMirror) createMirrorRequest(originalReq *http.Request, body *bytes.Buffer) (*http.Request, error) {
 	// 构建目标URL
 	targetURL := m.TargetURL + originalReq.URL.Path
 	if originalReq.URL.RawQuery != "" {
@@ -174,7 +219,7 @@ func (m *TrafficMirror) createMirrorRequest(originalReq *http.Request, body []by
 
 	var bodyReader io.Reader
 	if body != nil {
-		bodyReader = bytes.NewBuffer(body)
+		bodyReader = body
 	}
 
 	// 创建新请求
@@ -184,16 +229,12 @@ func (m *TrafficMirror) createMirrorRequest(originalReq *http.Request, body []by
 	}
 
 	// 复制头部
-	for key, values := range originalReq.Header {
-		// 跳过一些不应该复制的头部
-		lowerKey := strings.ToLower(key)
-		if lowerKey == "content-length" || lowerKey == "connection" || lowerKey == "keep-alive" {
-			continue
-		}
-		for _, value := range values {
-			mirrorReq.Header.Add(key, value)
-		}
-	}
+	mirrorReq.Header = originalReq.Header.Clone()
+
+	// 移除不应复制的头部
+	mirrorReq.Header.Del("Content-Length")
+	mirrorReq.Header.Del("Connection")
+	mirrorReq.Header.Del("Keep-Alive")
 
 	// 添加标识头
 	if m.AddMirrorHeaders {
@@ -203,14 +244,19 @@ func (m *TrafficMirror) createMirrorRequest(originalReq *http.Request, body []by
 
 	// 设置内容长度
 	if body != nil {
-		mirrorReq.ContentLength = int64(len(body))
+		mirrorReq.ContentLength = int64(body.Len())
 	}
 
 	return mirrorReq, nil
 }
 
 // sendMirrorRequest 发送复制请求
-func (m *TrafficMirror) sendMirrorRequest(mirrorReq *http.Request) {
+func (m *TrafficMirror) sendMirrorRequest(mirrorReq *http.Request, body *bytes.Buffer) {
+	// 使用完后将缓冲区放回池中
+	if body != nil {
+		defer m.bufferPool.Put(body)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(m.Timeout)*time.Second)
 	defer cancel()
 
@@ -273,7 +319,7 @@ func (m *TrafficMirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	}
 
 	// 复制请求体（这会恢复原始请求体）
-	bodyBytes, err := m.copyRequestBody(r)
+	bodyBuffer, err := m.copyRequestBody(r)
 	if err != nil {
 		m.logger.Error("failed to copy request body", zap.Error(err))
 		// 即使复制失败，也继续处理原始请求
@@ -281,14 +327,17 @@ func (m *TrafficMirror) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	}
 
 	// 创建复制请求
-	mirrorReq, err := m.createMirrorRequest(r, bodyBytes)
+	mirrorReq, err := m.createMirrorRequest(r, bodyBuffer)
 	if err != nil {
 		m.logger.Error("failed to create mirror request", zap.Error(err))
+		if bodyBuffer != nil {
+			m.bufferPool.Put(bodyBuffer) // 确保缓冲区被归还
+		}
 		return next.ServeHTTP(w, r)
 	}
 
 	// 异步发送复制请求
-	go m.sendMirrorRequest(mirrorReq)
+	go m.sendMirrorRequest(mirrorReq, bodyBuffer)
 
 	// 继续处理原始请求
 	return next.ServeHTTP(w, r)
