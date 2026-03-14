@@ -31,7 +31,7 @@ go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
 1.  Clone this repository:
     ```bash
-    git clone https://github.com/your-username/caddy-traffic-mirror.git
+    git clone https://github.com/baogaitou/caddy-traffic-mirror.git
     ```
 
 2.  Navigate to the project directory:
@@ -170,7 +170,7 @@ go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
 1.  克隆本仓库：
     ```bash
-    git clone https://github.com/your-username/caddy-traffic-mirror.git
+    git clone https://github.com/baogaitou/caddy-traffic-mirror.git
     ```
 
 2.  进入项目目录：

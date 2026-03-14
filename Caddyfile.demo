@@ -11,8 +11,10 @@
 # Origin
 :8090 {
     log {
-        output file ./access.log
-        format console
+        output stdout
+        format transform "{ts} [ORIGIN] {status} => {request>method} {request>uri} {duration}s" {
+            time_format "01-02 15:04:05"
+        }
     }
 
     route {
@@ -20,17 +22,17 @@
             respond "Demo" 200
         }
 
-        route /api/* {
-            traffic_mirror {
-                target_url http://localhost:9090
-                methods GET POST
-                # disable_log
-                # log_level INFO
-                add_mirror_headers true
-                timeout 3
+        handle /api/* {
+            # traffic_mirror 是 non-ordered handler，必须放在 route 块内
+            route {
+                traffic_mirror {
+                    target_url http://localhost:9090
+                    methods GET POST
+                    add_mirror_headers true
+                    timeout 3
+                }
+                respond "API from Origin" 200
             }
-
-            respond "API from Origin" 200
         }
 
         handle  {

@@ -2,3 +2,4 @@ caddy
 xcaddy
 caddy-linux
 *.log
+.VsCodeCounter

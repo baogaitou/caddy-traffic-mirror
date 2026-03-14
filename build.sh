@@ -21,7 +21,8 @@ fi
 # 编译本机版本
 echo "📦 正在编译本机版本..."
 $XCADDY build \
-    --with github.com/baogaitou/caddy-traffic-mirror=./
+    --with github.com/baogaitou/caddy-traffic-mirror=./ \
+    --with github.com/caddyserver/transform-encoder
 
 if [ $? -ne 0 ]; then
     echo "❌ 本机版本编译失败"
@@ -34,7 +35,8 @@ echo ""
 echo "🚀 开始交叉编译 Linux (amd64) 版本..."
 GOOS=linux GOARCH=amd64 $XCADDY build \
     --output caddy-linux \
-    --with github.com/baogaitou/caddy-traffic-mirror=./
+    --with github.com/baogaitou/caddy-traffic-mirror=./ \
+    --with github.com/caddyserver/transform-encoder
 
 if [ $? -ne 0 ]; then
     echo "❌ Linux 版本编译失败"
